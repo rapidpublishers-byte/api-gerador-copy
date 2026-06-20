@@ -3,24 +3,25 @@ import glob
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
-from openai import OpenAI
+import google.generativeai as genai
 
 app = Flask(__name__)
 CORS(app)
 
-# Inicializa a IA (a chave será puxada do Render de forma segura)
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+api_key = os.environ.get("GEMINI_API_KEY")
+if api_key:
+    genai.configure(api_key=api_key)
 
 @app.route('/transcrever', methods=['POST'])
 def transcrever():
     dados = request.get_json()
     url_video = dados.get('url')
+    idioma_escolhido = dados.get('idioma', 'Espanhol') # Recebe o idioma do seu HTML
     
     if not url_video:
         return jsonify({'erro': 'Nenhum link fornecido'}), 400
 
     try:
-        # 1. Baixar apenas o áudio do link (TikTok, YouTube, etc.)
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': 'audio.%(ext)s',
@@ -31,43 +32,28 @@ def transcrever():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url_video])
             
-        # Localiza o arquivo de áudio recém-baixado
         arquivo_audio = glob.glob("audio.*")[0]
+        audio_file = genai.upload_file(path=arquivo_audio)
         
-        # 2. Transcrição Inteligente com Whisper
-        with open(arquivo_audio, "rb") as audio_file:
-            transcricao = client.audio.transcriptions.create(
-                model="whisper-1", 
-                file=audio_file
-            )
-        texto_original = transcricao.text
-
-        # 3. Engenharia de Prompt para a Copy
+        # O prompt agora se adapta dinamicamente ao idioma escolhido
         prompt = f"""
         Atue como um copywriter e estrategista de conteúdo focado em vídeos culinários (estética 'food porn').
-        Aqui está a transcrição bruta de um vídeo:
-        "{texto_original}"
-        
-        Sua tarefa:
-        1. Extraia a receita completa e reescreva-a EM ESPANHOL, com os ingredientes e o passo a passo bem estruturados.
-        2. Crie uma legenda (copy) persuasiva, também em espanhol, com um gancho forte nas primeiras linhas para prender a atenção e maximizar a retenção.
+        Ouça o áudio deste vídeo e faça o seguinte:
+        1. Extraia a receita completa e escreva-a rigorosamente em {idioma_escolhido.upper()}, com os ingredientes e o passo a passo bem estruturados.
+        2. Crie uma legenda (copy) persuasiva, também em {idioma_escolhido.upper()}, com um gancho forte nas primeiras linhas para prender a atenção e maximizar a retenção do público.
         """
         
-        # 4. Geração do Texto Final
-        resposta = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}]
-        )
+        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+        response = model.generate_content([prompt, audio_file])
         
-        copy_final = resposta.choices[0].message.content
+        copy_final = response.text
         
-        # Limpar o servidor apagando o arquivo de áudio temporário
+        genai.delete_file(audio_file.name)
         os.remove(arquivo_audio)
 
         return jsonify({'copy': copy_final})
 
     except Exception as e:
-        # Garante que o arquivo seja apagado mesmo se houver erro
         for f in glob.glob("audio.*"):
             os.remove(f)
         return jsonify({'erro': str(e)}), 500
