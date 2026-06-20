@@ -12,30 +12,35 @@ api_key = os.environ.get("GEMINI_API_KEY")
 if api_key:
     genai.configure(api_key=api_key)
 
-@app.route('/transcrever', methods=['POST'])
-def transcrever():
+@app.route('/processar', methods=['POST'])
+def processar():
     dados = request.get_json()
-    url_video = dados.get('url')
-    idioma_escolhido = dados.get('idioma', 'Espanhol')
+    acao = dados.get('acao') # Descobre se você enviou um vídeo novo ou uma mensagem de ajuste
     
-    if not url_video:
-        return jsonify({'erro': 'Nenhum link fornecido'}), 400
-
     try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': 'audio.%(ext)s',
-            'quiet': True,
-            'noplaylist': True
-        }
+        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url_video])
+        if acao == 'video':
+            url_video = dados.get('url')
+            idioma_escolhido = dados.get('idioma', 'Espanhol')
             
-        arquivo_audio = glob.glob("audio.*")[0]
-        audio_file = genai.upload_file(path=arquivo_audio)
-        
-        prompt = f"""
+            if not url_video:
+                return jsonify({'erro': 'Nenhum link fornecido'}), 400
+
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': 'audio.%(ext)s',
+                'quiet': True,
+                'noplaylist': True
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url_video])
+                
+            arquivo_audio = glob.glob("audio.*")[0]
+            audio_file = genai.upload_file(path=arquivo_audio)
+            
+            prompt = f"""
 Você é meu especialista em copy para vídeos de receitas no TikTok/Facebook. Sua função é ouvir o áudio do vídeo em anexo e transformá-lo em uma copy final com alto potencial de retenção, usando meu DNA de copy.
 
 REGRA DE IDIOMA OBRIGATÓRIA: Todo o texto final (títulos, copy, descrição e listas) deve ser traduzido e gerado EXCLUSIVAMENTE em {idioma_escolhido.upper()}, mantendo o ritmo, os CTAs e o estilo falado natural do seu DNA.
@@ -63,9 +68,6 @@ Use ganchos no estilo:
 
 SEGUNDA LINHA:
 Nunca enfraqueça a segunda linha. Ela deve explicar o motivo da pessoa assistir. Use sempre uma promessa clara.
-Exemplos:
-“E hoje eu te ensino o segredo para ele ficar cremoso por dentro e douradinho por cima.”
-“E hoje eu te ensino como fazer uma receita completa, fácil e deliciosa.”
 
 ESTILO DA COPY:
 A copy deve ser popular, falada, natural e fácil de narrar. Não escreva como texto técnico. Não use excesso de adjetivos.
@@ -99,7 +101,7 @@ TÍTULOS PARA TIKTOK:
 Criar títulos curtos, com ação ou curiosidade. Ex: “FAÇA ESSES ANÉIS DA PRÓXIMA VEZ”.
 
 DESCRIÇÃO COM SEO:
-Use palavras-chave naturais no texto da descrição (receita completa, receita fácil, sobremesa fácil, sem forno, etc).
+Use palavras-chave naturais no texto da descrição.
 
 LISTA DE INGREDIENTES PARA LEGENDAR VÍDEO E DESCRIÇÃO:
 - Para legendar: INGREDIENTE EM CAIXA ALTA, quantidade embaixo em minúscula. Incluir tempo de FORNO/GELADEIRA.
@@ -111,17 +113,32 @@ Entregue a resposta no seguinte formato:
 2. Copy Final da Narração
 3. Lista de Ingredientes (Legenda)
 4. Descrição com SEO e Ingredientes
-        """
-        
-        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
-        response = model.generate_content([prompt, audio_file])
-        
-        copy_final = response.text
-        
-        genai.delete_file(audio_file.name)
-        os.remove(arquivo_audio)
+            """
+            
+            chat = model.start_chat(history=[])
+            response = chat.send_message([prompt, audio_file])
+            
+            genai.delete_file(audio_file.name)
+            os.remove(arquivo_audio)
 
-        return jsonify({'copy': copy_final})
+            return jsonify({'resposta': response.text})
+
+        elif acao == 'texto':
+            # Rota para conversar e ajustar a copy
+            mensagem = dados.get('mensagem')
+            historico_front = dados.get('historico', [])
+            
+            history_gemini = []
+            for msg in historico_front:
+                history_gemini.append({"role": msg["role"], "parts": [msg["text"]]})
+                
+            chat = model.start_chat(history=history_gemini)
+            response = chat.send_message(mensagem)
+            
+            return jsonify({'resposta': response.text})
+
+        else:
+            return jsonify({'erro': 'Ação inválida'}), 400
 
     except Exception as e:
         for f in glob.glob("audio.*"):
