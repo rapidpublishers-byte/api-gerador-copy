@@ -1,9 +1,15 @@
 import os
+import glob
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import yt_dlp
+from openai import OpenAI
 
 app = Flask(__name__)
-CORS(app) # Libera o acesso da sua página na Hostinger
+CORS(app)
+
+# Inicializa a IA (a chave será puxada do Render de forma segura)
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 @app.route('/transcrever', methods=['POST'])
 def transcrever():
@@ -14,14 +20,56 @@ def transcrever():
         return jsonify({'erro': 'Nenhum link fornecido'}), 400
 
     try:
-        # A lógica real da IA entrará aqui nas próximas etapas.
-        # Por enquanto, ele apenas devolve uma mensagem de sucesso para testarmos a conexão.
+        # 1. Baixar apenas o áudio do link (TikTok, YouTube, etc.)
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': 'audio.%(ext)s',
+            'quiet': True,
+            'noplaylist': True
+        }
         
-        texto_simulado = f"Sucesso! O link recebido foi: {url_video}\n\nAqui entrará a sua copy persuasiva gerada pela Inteligência Artificial."
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url_video])
+            
+        # Localiza o arquivo de áudio recém-baixado
+        arquivo_audio = glob.glob("audio.*")[0]
         
-        return jsonify({'copy': texto_simulado})
+        # 2. Transcrição Inteligente com Whisper
+        with open(arquivo_audio, "rb") as audio_file:
+            transcricao = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file
+            )
+        texto_original = transcricao.text
+
+        # 3. Engenharia de Prompt para a Copy
+        prompt = f"""
+        Atue como um copywriter e estrategista de conteúdo focado em vídeos culinários (estética 'food porn').
+        Aqui está a transcrição bruta de um vídeo:
+        "{texto_original}"
+        
+        Sua tarefa:
+        1. Extraia a receita completa e reescreva-a EM ESPANHOL, com os ingredientes e o passo a passo bem estruturados.
+        2. Crie uma legenda (copy) persuasiva, também em espanhol, com um gancho forte nas primeiras linhas para prender a atenção e maximizar a retenção.
+        """
+        
+        # 4. Geração do Texto Final
+        resposta = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        copy_final = resposta.choices[0].message.content
+        
+        # Limpar o servidor apagando o arquivo de áudio temporário
+        os.remove(arquivo_audio)
+
+        return jsonify({'copy': copy_final})
 
     except Exception as e:
+        # Garante que o arquivo seja apagado mesmo se houver erro
+        for f in glob.glob("audio.*"):
+            os.remove(f)
         return jsonify({'erro': str(e)}), 500
 
 if __name__ == '__main__':
