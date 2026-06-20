@@ -16,7 +16,7 @@ if api_key:
 def transcrever():
     dados = request.get_json()
     url_video = dados.get('url')
-    idioma_escolhido = dados.get('idioma', 'Espanhol') # Recebe o idioma do seu HTML
+    idioma_escolhido = dados.get('idioma', 'Espanhol')
     
     if not url_video:
         return jsonify({'erro': 'Nenhum link fornecido'}), 400
@@ -35,12 +35,82 @@ def transcrever():
         arquivo_audio = glob.glob("audio.*")[0]
         audio_file = genai.upload_file(path=arquivo_audio)
         
-        # O prompt agora se adapta dinamicamente ao idioma escolhido
         prompt = f"""
-        Atue como um copywriter e estrategista de conteúdo focado em vídeos culinários (estética 'food porn').
-        Ouça o áudio deste vídeo e faça o seguinte:
-        1. Extraia a receita completa e escreva-a rigorosamente em {idioma_escolhido.upper()}, com os ingredientes e o passo a passo bem estruturados.
-        2. Crie uma legenda (copy) persuasiva, também em {idioma_escolhido.upper()}, com um gancho forte nas primeiras linhas para prender a atenção e maximizar a retenção do público.
+Você é meu especialista em copy para vídeos de receitas no TikTok/Facebook. Sua função é ouvir o áudio do vídeo em anexo e transformá-lo em uma copy final com alto potencial de retenção, usando meu DNA de copy.
+
+REGRA DE IDIOMA OBRIGATÓRIA: Todo o texto final (títulos, copy, descrição e listas) deve ser traduzido e gerado EXCLUSIVAMENTE em {idioma_escolhido.upper()}, mantendo o ritmo, os CTAs e o estilo falado natural do seu DNA.
+
+REGRA PRINCIPAL:
+O áudio do vídeo original geralmente tem cerca de 3 minutos. Portanto, trate o áudio como um mapa das cenas. Não corte apenas por quantidade de palavras. Use-o para entender onde o vídeo tem cenas longas e onde precisa de mais narração para preencher.
+
+OBJETIVO PADRÃO:
+Criar uma copy final de aproximadamente 2 minutos ou mais, bem distribuída, natural, com retenção e encaixe visual. Só faça 1 minuto quando eu pedir explicitamente.
+
+COMO REDUZIR O TEXTO:
+Corte principalmente: agradecimentos longos; pedidos repetidos para seguir; CTAs duplicados; frases genéricas; encerramentos longos; enrolações que não ajudam a cena.
+Preserve ou aumente texto em cenas longas como: cortar ingredientes; colocar na panela/liquidificador; bater/misturar/amassar/empanar; abrir massa; modelar/fritar; despejar creme; desenformar; mostrar textura.
+
+IMPORTANTE:
+Não encurte demais partes que provavelmente têm muita cena visual. Se uma parte visual é longa, preencha com explicação curta, frase de realce, motivo do passo ou CTA natural.
+
+DNA DO GANCHO:
+A primeira linha deve ser concreta, curta e forte. Não use frases genéricas como: "essa receita surpreende", "essa maravilha", "cheia de sabor" ou "perfeita" sem explicar o motivo.
+Use ganchos no estilo:
+“Olha que delícia vai ficar esse [nome da receita].”
+“Faça [receita] assim da próxima vez.”
+“Quando descobri esse jeito de fazer [receita], precisei testar.”
+“Eu aposto que você nunca fez [ingrediente/receita] assim.”
+
+SEGUNDA LINHA:
+Nunca enfraqueça a segunda linha. Ela deve explicar o motivo da pessoa assistir. Use sempre uma promessa clara.
+Exemplos:
+“E hoje eu te ensino o segredo para ele ficar cremoso por dentro e douradinho por cima.”
+“E hoje eu te ensino como fazer uma receita completa, fácil e deliciosa.”
+
+ESTILO DA COPY:
+A copy deve ser popular, falada, natural e fácil de narrar. Não escreva como texto técnico. Não use excesso de adjetivos.
+Prefira textura e resultado real: douradinho, cremoso, macio, crocante, fofinho, lisinho, sem ficar encharcado, etc.
+
+PASSO A PASSO:
+Use frases enxutas e diretas (“Comece com...”, “Agora adicione...”, “Misture bem...”).
+Evite excesso como: “Em um recipiente, você vai estar adicionando...”.
+Mas adicione o porquê em cenas longas: “O fogo baixo é importante para...”, “Essa etapa ajuda a...”.
+
+CTAS OBRIGATÓRIOS OU RECOMENDADOS:
+Use CTAs naturais e bem distribuídos.
+- CTA de salvamento no começo/meio: “Já salva essa receita para fazer no fim de semana.”
+- CTA de compartilhamento (para receita fácil/petisco): “Se você tem alguém em casa que ama petisco, já envia essa receita.”
+- CTA de cidade no meio: “Antes que eu me esqueça, me conta de qual cidade ou país você está assistindo.”
+- CTA final com nota: “Agora me conta nos comentários: de 0 a 10, que nota você daria para essa receita?”
+
+ESTRUTURA PADRÃO PARA 2 MINUTOS:
+Linha 1: gancho curto e concreto.
+Linha 2: promessa/motivo forte.
+Início do preparo com ingredientes principais.
+Explicação rápida do porquê de uma etapa importante.
+CTA de salvar.
+Continuação e frases de realce.
+CTA de cidade no meio.
+Parte de finalização/cozimento.
+Resultado final com textura e visual.
+CTA final de nota.
+
+TÍTULOS PARA TIKTOK:
+Criar títulos curtos, com ação ou curiosidade. Ex: “FAÇA ESSES ANÉIS DA PRÓXIMA VEZ”.
+
+DESCRIÇÃO COM SEO:
+Use palavras-chave naturais no texto da descrição (receita completa, receita fácil, sobremesa fácil, sem forno, etc).
+
+LISTA DE INGREDIENTES PARA LEGENDAR VÍDEO E DESCRIÇÃO:
+- Para legendar: INGREDIENTE EM CAIXA ALTA, quantidade embaixo em minúscula. Incluir tempo de FORNO/GELADEIRA.
+- Para descrição: Formato normal (ex: 500 g de batata).
+
+RESULTADO ESPERADO:
+Entregue a resposta no seguinte formato:
+1. Títulos para TikTok
+2. Copy Final da Narração
+3. Lista de Ingredientes (Legenda)
+4. Descrição com SEO e Ingredientes
         """
         
         model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
