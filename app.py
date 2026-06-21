@@ -5,22 +5,12 @@ import tempfile
 import time
 from pathlib import Path
 
-import google.generativeai as genai
-import requests
-import yt_dlp
 from flask import Flask, after_this_request, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-
-# =========================================================
-# RapidPublishers AI Desk - Backend corrigido
-# =========================================================
-# Variáveis importantes no Render/local:
-# GEMINI_API_KEY=coloque_sua_chave_aqui
-# GEMINI_MODEL=gemini-1.5-flash        (opcional)
-# GEMINI_TTS_MODEL=gemini-2.5-flash-preview-tts  (opcional)
-# PORT=5000                            (opcional)
-# =========================================================
+from google import genai
+from gtts import gTTS
+import yt_dlp
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_HTML = BASE_DIR / "gerador.html"
@@ -28,12 +18,8 @@ APP_HTML = BASE_DIR / "gerador.html"
 app = Flask(__name__, static_folder=None)
 CORS(app)
 
-api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
-GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
-
-if api_key:
-    genai.configure(api_key=api_key)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
 ALLOWED_UPLOAD_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
@@ -42,38 +28,42 @@ ALLOWED_UPLOAD_EXTENSIONS = {
 
 
 def json_error(message: str, status: int = 400):
-    return jsonify({"ok": False, "erro": message}), status
-
-
-def require_gemini_key():
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY não foi configurada no servidor.")
+    return jsonify({"ok": False, "erro": str(message)}), status
 
 
 def get_json_body():
     return request.get_json(silent=True) or {}
 
 
-def get_model():
-    require_gemini_key()
-    return genai.GenerativeModel(model_name=GEMINI_MODEL)
+def get_client():
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY não foi configurada no Render.")
+    return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def build_prompt(idioma: str = "Espanhol") -> str:
-    idioma = (idioma or "Espanhol").strip()
+def response_text(response) -> str:
+    return getattr(response, "text", None) or ""
+
+
+def build_prompt(idioma: str = "Português", minutos: str = "2") -> str:
+    idioma = (idioma or "Português").strip()
+    minutos = str(minutos or "2").strip()
     return f"""
 Você é o especialista de copy da RapidPublishers AI Desk.
 Gere todo o conteúdo em {idioma.upper()}.
 
+Objetivo de duração interna: aproximadamente {minutos} minuto(s).
+IMPORTANTE: use essa duração apenas para calibrar o tamanho da narração. NÃO escreva no texto que a copy tem 1, 2 ou 3 minutos.
+
 DNA obrigatório da copy:
 - Primeira linha forte, concreta e curiosa. Evite começos genéricos.
 - Segunda linha com motivo claro para continuar assistindo.
-- Inserir CTA de salvar no início ou meio inicial, sem soar forçado.
-- Inserir CTA de compartilhar em momento natural.
-- Inserir pergunta de cidade/país no meio da copy.
-- Finalizar com CTA pedindo nota de 0 a 10.
+- CTA de salvar no início ou meio inicial, sem soar forçado.
+- CTA de compartilhar em momento natural.
+- Pergunta de cidade/país no meio da copy.
+- Final com CTA pedindo nota de 0 a 10.
 - Manter ritmo de vídeo: não encurtar demais cenas longas como cortar, misturar, empanar, abrir massa, fritar, virar, despejar creme, colocar na forma, desenformar e finalizar.
-- Cortar principalmente CTAs repetidos, agradecimentos longos e frases vazias.
+- Cortar CTAs repetidos, agradecimentos longos e frases vazias.
 - Evitar a expressão "comprado pronto" e comparações com produto pronto.
 - Público principal: adulto, culinária caseira, linguagem clara, intensa e viral.
 
@@ -86,7 +76,7 @@ Entregue exatamente nesta estrutura:
 Texto narrado, com frases curtas, bem distribuídas e pronto para áudio.
 
 # LISTA DE INGREDIENTES
-Ingredientes em lista clara. Se houver forno, geladeira ou tempo, incluir em letras maiúsculas.
+Ingredientes em lista clara. Se houver forno, geladeira ou tempo, incluir em letras MAIÚSCULAS.
 
 # DESCRIÇÃO SEO
 Descrição curta com palavras-chave naturais.
@@ -96,30 +86,58 @@ Descrição curta com palavras-chave naturais.
 """.strip()
 
 
-def wait_for_gemini_file(uploaded_file, timeout_seconds: int = 120):
-    """Aguarda o arquivo ficar pronto no Gemini Files API."""
+def extract_copy_final(text: str) -> str:
+    """Tenta pegar só a seção COPY FINAL para gerar áudio."""
+    if not text:
+        return ""
+    upper = text.upper()
+    start_marker = "# COPY FINAL"
+    start = upper.find(start_marker)
+    if start == -1:
+        return text.strip()
+    start = start + len(start_marker)
+
+    next_markers = ["# LISTA DE INGREDIENTES", "# DESCRIÇÃO SEO", "# HASHTAGS", "# TITULOS", "# TÍTULOS"]
+    end_positions = []
+    for marker in next_markers:
+        pos = upper.find(marker, start)
+        if pos != -1:
+            end_positions.append(pos)
+    end = min(end_positions) if end_positions else len(text)
+    return text[start:end].strip("\n :-")
+
+
+def wait_for_file_ready(client, uploaded_file, timeout_seconds: int = 120):
+    """Aguarda arquivo processar quando o SDK expõe estado do arquivo."""
     start = time.time()
     current = uploaded_file
-    while getattr(current, "state", None) and str(current.state.name).upper() == "PROCESSING":
+    while True:
+        state = getattr(current, "state", None)
+        state_name = getattr(state, "name", None) or str(state or "")
+        state_name = state_name.upper()
+        if "PROCESSING" not in state_name:
+            break
         if time.time() - start > timeout_seconds:
             raise TimeoutError("O arquivo demorou demais para processar no Gemini.")
         time.sleep(2)
-        current = genai.get_file(current.name)
+        current = client.files.get(name=uploaded_file.name)
 
-    if getattr(current, "state", None) and str(current.state.name).upper() == "FAILED":
+    state = getattr(current, "state", None)
+    state_name = getattr(state, "name", None) or str(state or "")
+    if "FAILED" in state_name.upper():
         raise RuntimeError("O Gemini não conseguiu processar este arquivo.")
     return current
 
 
-def upload_file_to_gemini(path: str):
-    uploaded = genai.upload_file(path=path)
-    return wait_for_gemini_file(uploaded)
+def upload_file_to_gemini(client, path: str):
+    uploaded = client.files.upload(file=path)
+    return wait_for_file_ready(client, uploaded)
 
 
-def safe_delete_gemini_file(uploaded_file):
+def safe_delete_gemini_file(client, uploaded_file):
     try:
         if uploaded_file and getattr(uploaded_file, "name", None):
-            genai.delete_file(uploaded_file.name)
+            client.files.delete(name=uploaded_file.name)
     except Exception:
         pass
 
@@ -136,13 +154,15 @@ def download_best_audio(url: str, output_dir: str) -> str:
         "no_warnings": True,
         "noplaylist": True,
         "retries": 2,
+        "socket_timeout": 30,
+        "extractor_args": {"tiktok": {"api_hostname": ["api22-normal-c-useast1a.tiktokv.com"]}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
     files = glob.glob(os.path.join(output_dir, "audio.*"))
     if not files:
-        raise RuntimeError("Não consegui baixar o áudio do link informado.")
+        raise RuntimeError("Não consegui baixar o áudio do link informado. Se for TikTok bloqueado, baixe o vídeo e envie por upload.")
     return files[0]
 
 
@@ -159,6 +179,7 @@ def download_best_mp4(url: str, output_dir: str) -> str:
         "noplaylist": True,
         "merge_output_format": "mp4",
         "retries": 2,
+        "socket_timeout": 30,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -167,6 +188,19 @@ def download_best_mp4(url: str, output_dir: str) -> str:
     if not files:
         raise RuntimeError("Não consegui baixar o MP4 do link informado.")
     return files[0]
+
+
+def gtts_lang(idioma: str) -> str:
+    idioma = (idioma or "").lower()
+    if "espan" in idioma or "span" in idioma:
+        return "es"
+    if "ingl" in idioma or "engl" in idioma:
+        return "en"
+    if "fran" in idioma or "fren" in idioma:
+        return "fr"
+    if "ital" in idioma:
+        return "it"
+    return "pt"
 
 
 @app.route("/", methods=["GET"])
@@ -181,24 +215,38 @@ def health():
     return jsonify({
         "ok": True,
         "app": "RapidPublishers AI Desk",
-        "gemini_key_configurada": bool(api_key),
+        "status": "online",
+        "sdk": "google-genai",
+        "gemini_key_configurada": bool(GEMINI_API_KEY),
         "gemini_model": GEMINI_MODEL,
+    })
+
+
+@app.route("/debug-key", methods=["GET"])
+def debug_key():
+    return jsonify({
+        "tem_chave": bool(GEMINI_API_KEY),
+        "tamanho": len(GEMINI_API_KEY),
+        "comeca_com": GEMINI_API_KEY[:4] if GEMINI_API_KEY else "",
+        "sdk": "google-genai",
     })
 
 
 @app.route("/processar", methods=["POST"])
 def processar():
     try:
-        model = get_model()
+        client = get_client()
 
         if request.content_type and "multipart/form-data" in request.content_type:
             acao = request.form.get("acao", "upload")
-            idioma = request.form.get("idioma", "Espanhol")
+            idioma = request.form.get("idioma", "Português")
+            minutos = request.form.get("minutos", "2")
             dados = {}
         else:
             dados = get_json_body()
             acao = dados.get("acao")
-            idioma = dados.get("idioma", "Espanhol")
+            idioma = dados.get("idioma", "Português")
+            minutos = dados.get("minutos", "2")
 
         if acao == "video":
             url = (dados.get("url") or "").strip()
@@ -206,11 +254,14 @@ def processar():
                 audio_path = download_best_audio(url, tmpdir)
                 gemini_file = None
                 try:
-                    gemini_file = upload_file_to_gemini(audio_path)
-                    response = model.generate_content([build_prompt(idioma), gemini_file])
-                    return jsonify({"ok": True, "resposta": response.text or ""})
+                    gemini_file = upload_file_to_gemini(client, audio_path)
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=[build_prompt(idioma, minutos), gemini_file],
+                    )
+                    return jsonify({"ok": True, "resposta": response_text(response)})
                 finally:
-                    safe_delete_gemini_file(gemini_file)
+                    safe_delete_gemini_file(client, gemini_file)
 
         if acao == "upload":
             if "file" not in request.files:
@@ -227,36 +278,72 @@ def processar():
                 file.save(path)
                 gemini_file = None
                 try:
-                    gemini_file = upload_file_to_gemini(path)
-                    response = model.generate_content([build_prompt(idioma), gemini_file])
-                    return jsonify({"ok": True, "resposta": response.text or ""})
+                    gemini_file = upload_file_to_gemini(client, path)
+                    response = client.models.generate_content(
+                        model=GEMINI_MODEL,
+                        contents=[build_prompt(idioma, minutos), gemini_file],
+                    )
+                    return jsonify({"ok": True, "resposta": response_text(response)})
                 finally:
-                    safe_delete_gemini_file(gemini_file)
+                    safe_delete_gemini_file(client, gemini_file)
 
         if acao == "tempo":
-            minutos = str(dados.get("minutos") or "2").strip()
             texto = (dados.get("texto") or "").strip()
             if not texto:
-                historico = dados.get("historico") or []
-                if historico and isinstance(historico, list):
-                    texto = str(historico[0].get("text", "")).strip()
-
-            if not texto:
-                return json_error("Cole ou gere uma copy antes de ajustar o tempo.")
+                return json_error("Gere ou cole uma copy antes de ajustar o tempo.")
 
             prompt = f"""
-Reescreva a copy abaixo para aproximadamente {minutos} minuto(s), em {idioma.upper()}, mantendo o DNA RapidPublishers.
-Não resuma demais cenas de preparo. Distribua a narração para preencher bem o vídeo.
-Mantenha CTAs naturais: salvar, compartilhar, cidade/país no meio e nota de 0 a 10 no final.
+Reescreva a copy abaixo em {idioma.upper()}, usando aproximadamente {minutos} minuto(s) apenas como referência interna de tamanho.
+Não diga no texto que a copy tem essa duração.
+Mantenha o DNA RapidPublishers: gancho forte, CTA de salvar, compartilhar, cidade/país no meio e nota de 0 a 10 no final.
+Não resuma demais cenas longas de preparo.
 
 COPY BASE:
 {texto}
 """.strip()
-            response = model.generate_content(prompt)
-            return jsonify({"ok": True, "resposta": response.text or ""})
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            return jsonify({"ok": True, "resposta": response_text(response)})
 
         return json_error("Ação inválida. Use: video, upload ou tempo.")
 
+    except Exception as e:
+        msg = str(e)
+        if "tiktok" in msg.lower() or "unable to download" in msg.lower():
+            msg = "Falhou ao buscar o vídeo. O TikTok/Reels pode bloquear servidores como o Render. Tente baixar o vídeo e enviar pelo upload. Detalhe: " + msg
+        return json_error(msg, 500)
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        client = get_client()
+        dados = get_json_body()
+        texto = (dados.get("texto") or "").strip()
+        pedido = (dados.get("pedido") or "").strip()
+        idioma = dados.get("idioma", "Português")
+        minutos = dados.get("minutos", "2")
+
+        if not texto:
+            return json_error("Gere ou cole uma copy antes de pedir ajuste.")
+        if not pedido:
+            return json_error("Escreva o ajuste que você quer.")
+
+        prompt = f"""
+Você é o editor de copy da RapidPublishers AI Desk.
+Idioma: {idioma.upper()}.
+Duração interna desejada: aproximadamente {minutos} minuto(s), sem mencionar essa duração no texto.
+
+Pedido do usuário:
+{pedido}
+
+Copy atual:
+{texto}
+
+Aplique o pedido mantendo o DNA RapidPublishers.
+Entregue a copy ajustada completa, organizada e pronta para narrar.
+""".strip()
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        return jsonify({"ok": True, "resposta": response_text(response)})
     except Exception as e:
         return json_error(str(e), 500)
 
@@ -264,40 +351,26 @@ COPY BASE:
 @app.route("/gerar_audio", methods=["POST"])
 def gerar_audio():
     try:
-        require_gemini_key()
         dados = get_json_body()
         texto = (dados.get("texto") or "").strip()
-        voz = (dados.get("voz") or "Achird").strip()
-
+        idioma = dados.get("idioma", "Português")
         if not texto:
             return json_error("Informe o texto para gerar áudio.")
 
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent?key={api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": texto}]}],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {"voiceName": voz}
-                    }
-                }
-            }
-        }
-        resp = requests.post(endpoint, json=payload, timeout=120)
-        data = resp.json()
+        texto_audio = extract_copy_final(texto)
+        if not texto_audio:
+            texto_audio = texto
 
-        if resp.status_code >= 400:
-            return json_error(data.get("error", {}).get("message", "Erro ao gerar áudio."), resp.status_code)
-
-        part = data["candidates"][0]["content"]["parts"][0]
-        inline = part.get("inlineData") or part.get("inline_data")
-        audio_b64 = inline["data"]
-        mime_type = inline.get("mimeType", "audio/wav")
-        return jsonify({"ok": True, "audio_base64": audio_b64, "mime_type": mime_type})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp3_path = os.path.join(tmpdir, "rapidpublishers_audio.mp3")
+            tts = gTTS(text=texto_audio, lang=gtts_lang(idioma), slow=False)
+            tts.save(mp3_path)
+            with open(mp3_path, "rb") as f:
+                audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+        return jsonify({"ok": True, "audio_base64": audio_b64, "mime_type": "audio/mpeg"})
 
     except Exception as e:
-        return json_error(str(e), 500)
+        return json_error("Erro ao gerar áudio: " + str(e), 500)
 
 
 @app.route("/baixar_mp4", methods=["POST"])
