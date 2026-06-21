@@ -2,7 +2,5 @@ flask
 flask-cors
 yt-dlp
 google-genai
-gTTS
-requests
 werkzeug
 gunicorn
