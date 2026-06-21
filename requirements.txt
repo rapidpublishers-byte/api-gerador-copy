@@ -2,3 +2,5 @@ flask
 flask-cors
 yt-dlp
 google-generativeai
+requests
+werkzeug
