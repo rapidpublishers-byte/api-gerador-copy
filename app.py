@@ -5,21 +5,21 @@ import tempfile
 import time
 from pathlib import Path
 
+import google.generativeai as genai
+import requests
 import yt_dlp
 from flask import Flask, after_this_request, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
-from google import genai
-from google.genai import types
 from werkzeug.utils import secure_filename
 
 # =========================================================
-# RapidPublishers AI Desk - Backend compatível com novas keys AQ.*
-# SDK: google-genai
-# Variáveis no Render:
-# GEMINI_API_KEY=sua_chave_do_Google_AI_Studio
-# GEMINI_MODEL=gemini-2.5-flash              opcional
-# GEMINI_TTS_MODEL=gemini-3.1-flash-tts-preview  opcional
-# PORT=5000                                  opcional
+# RapidPublishers AI Desk - Backend corrigido
+# =========================================================
+# Variáveis importantes no Render/local:
+# GEMINI_API_KEY=coloque_sua_chave_aqui
+# GEMINI_MODEL=gemini-1.5-flash        (opcional)
+# GEMINI_TTS_MODEL=gemini-2.5-flash-preview-tts  (opcional)
+# PORT=5000                            (opcional)
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,8 +29,11 @@ app = Flask(__name__, static_folder=None)
 CORS(app)
 
 api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
-GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
+
+if api_key:
+    genai.configure(api_key=api_key)
 
 ALLOWED_UPLOAD_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
@@ -47,13 +50,13 @@ def require_gemini_key():
         raise RuntimeError("GEMINI_API_KEY não foi configurada no servidor.")
 
 
-def get_client():
-    require_gemini_key()
-    return genai.Client(api_key=api_key)
-
-
 def get_json_body():
     return request.get_json(silent=True) or {}
+
+
+def get_model():
+    require_gemini_key()
+    return genai.GenerativeModel(model_name=GEMINI_MODEL)
 
 
 def build_prompt(idioma: str = "Espanhol") -> str:
@@ -93,31 +96,30 @@ Descrição curta com palavras-chave naturais.
 """.strip()
 
 
-def wait_for_gemini_file(client, uploaded_file, timeout_seconds: int = 180):
+def wait_for_gemini_file(uploaded_file, timeout_seconds: int = 120):
+    """Aguarda o arquivo ficar pronto no Gemini Files API."""
     start = time.time()
     current = uploaded_file
-
     while getattr(current, "state", None) and str(current.state.name).upper() == "PROCESSING":
         if time.time() - start > timeout_seconds:
             raise TimeoutError("O arquivo demorou demais para processar no Gemini.")
-        time.sleep(3)
-        current = client.files.get(name=current.name)
+        time.sleep(2)
+        current = genai.get_file(current.name)
 
     if getattr(current, "state", None) and str(current.state.name).upper() == "FAILED":
         raise RuntimeError("O Gemini não conseguiu processar este arquivo.")
-
     return current
 
 
-def upload_file_to_gemini(client, path: str):
-    uploaded = client.files.upload(file=path)
-    return wait_for_gemini_file(client, uploaded)
+def upload_file_to_gemini(path: str):
+    uploaded = genai.upload_file(path=path)
+    return wait_for_gemini_file(uploaded)
 
 
-def safe_delete_gemini_file(client, uploaded_file):
+def safe_delete_gemini_file(uploaded_file):
     try:
         if uploaded_file and getattr(uploaded_file, "name", None):
-            client.files.delete(name=uploaded_file.name)
+            genai.delete_file(uploaded_file.name)
     except Exception:
         pass
 
@@ -179,30 +181,15 @@ def health():
     return jsonify({
         "ok": True,
         "app": "RapidPublishers AI Desk",
-        "status": "online",
         "gemini_key_configurada": bool(api_key),
-        "gemini_key_prefix": api_key[:4] if api_key else "",
         "gemini_model": GEMINI_MODEL,
-    })
-
-
-@app.route("/debug-key", methods=["GET"])
-def debug_key():
-    k = os.environ.get("GEMINI_API_KEY", "").strip()
-    return jsonify({
-        "tem_chave": bool(k),
-        "comeca_com": k[:4] if k else "",
-        "tamanho": len(k),
-        "termina_com": k[-4:] if k else ""
     })
 
 
 @app.route("/processar", methods=["POST"])
 def processar():
-    client = None
-    gemini_file = None
     try:
-        client = get_client()
+        model = get_model()
 
         if request.content_type and "multipart/form-data" in request.content_type:
             acao = request.form.get("acao", "upload")
@@ -217,15 +204,13 @@ def processar():
             url = (dados.get("url") or "").strip()
             with tempfile.TemporaryDirectory() as tmpdir:
                 audio_path = download_best_audio(url, tmpdir)
+                gemini_file = None
                 try:
-                    gemini_file = upload_file_to_gemini(client, audio_path)
-                    response = client.models.generate_content(
-                        model=GEMINI_MODEL,
-                        contents=[build_prompt(idioma), gemini_file]
-                    )
+                    gemini_file = upload_file_to_gemini(audio_path)
+                    response = model.generate_content([build_prompt(idioma), gemini_file])
                     return jsonify({"ok": True, "resposta": response.text or ""})
                 finally:
-                    safe_delete_gemini_file(client, gemini_file)
+                    safe_delete_gemini_file(gemini_file)
 
         if acao == "upload":
             if "file" not in request.files:
@@ -240,15 +225,13 @@ def processar():
             with tempfile.TemporaryDirectory() as tmpdir:
                 path = os.path.join(tmpdir, filename or "arquivo_upload")
                 file.save(path)
+                gemini_file = None
                 try:
-                    gemini_file = upload_file_to_gemini(client, path)
-                    response = client.models.generate_content(
-                        model=GEMINI_MODEL,
-                        contents=[build_prompt(idioma), gemini_file]
-                    )
+                    gemini_file = upload_file_to_gemini(path)
+                    response = model.generate_content([build_prompt(idioma), gemini_file])
                     return jsonify({"ok": True, "resposta": response.text or ""})
                 finally:
-                    safe_delete_gemini_file(client, gemini_file)
+                    safe_delete_gemini_file(gemini_file)
 
         if acao == "tempo":
             minutos = str(dados.get("minutos") or "2").strip()
@@ -269,7 +252,7 @@ Mantenha CTAs naturais: salvar, compartilhar, cidade/país no meio e nota de 0 a
 COPY BASE:
 {texto}
 """.strip()
-            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            response = model.generate_content(prompt)
             return jsonify({"ok": True, "resposta": response.text or ""})
 
         return json_error("Ação inválida. Use: video, upload ou tempo.")
@@ -281,7 +264,7 @@ COPY BASE:
 @app.route("/gerar_audio", methods=["POST"])
 def gerar_audio():
     try:
-        client = get_client()
+        require_gemini_key()
         dados = get_json_body()
         texto = (dados.get("texto") or "").strip()
         voz = (dados.get("voz") or "Achird").strip()
@@ -289,33 +272,28 @@ def gerar_audio():
         if not texto:
             return json_error("Informe o texto para gerar áudio.")
 
-        response = client.models.generate_content(
-            model=GEMINI_TTS_MODEL,
-            contents=texto,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name=voz
-                        )
-                    )
-                )
-            )
-        )
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": texto}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {"voiceName": voz}
+                    }
+                }
+            }
+        }
+        resp = requests.post(endpoint, json=payload, timeout=120)
+        data = resp.json()
 
-        part = response.candidates[0].content.parts[0]
-        inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
-        if not inline:
-            raise RuntimeError("O Gemini não retornou áudio.")
+        if resp.status_code >= 400:
+            return json_error(data.get("error", {}).get("message", "Erro ao gerar áudio."), resp.status_code)
 
-        audio_data = inline.data
-        if isinstance(audio_data, bytes):
-            audio_b64 = base64.b64encode(audio_data).decode("utf-8")
-        else:
-            audio_b64 = str(audio_data)
-
-        mime_type = getattr(inline, "mime_type", None) or getattr(inline, "mimeType", None) or "audio/wav"
+        part = data["candidates"][0]["content"]["parts"][0]
+        inline = part.get("inlineData") or part.get("inline_data")
+        audio_b64 = inline["data"]
+        mime_type = inline.get("mimeType", "audio/wav")
         return jsonify({"ok": True, "audio_base64": audio_b64, "mime_type": mime_type})
 
     except Exception as e:
