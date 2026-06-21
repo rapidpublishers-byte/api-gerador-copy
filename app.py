@@ -321,7 +321,15 @@ def baixar_mp4():
 
     except Exception as e:
         return json_error(str(e), 500)
-
+@app.route('/debug-key', methods=['GET'])
+def debug_key():
+    k = os.environ.get("GEMINI_API_KEY", "")
+    return jsonify({
+        "tem_chave": bool(k),
+        "comeca_com": k[:4] if k else "",
+        "tamanho": len(k),
+        "termina_com": k[-4:] if k else ""
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
